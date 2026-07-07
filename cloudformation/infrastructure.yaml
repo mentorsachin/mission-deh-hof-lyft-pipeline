@@ -197,3 +197,7 @@ Outputs:
     Value: !Ref PipelineAlertsTopic
     Export:
       Name: mission-deh-hof-sns-topic-arn
+  SchedulerRoleArn:
+    Value: !GetAtt SchedulerRole.Arn
+    Export:
+      Name: mission-deh-hof-scheduler-role-arn

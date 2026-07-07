@@ -1,0 +1,295 @@
+# Copyright © Sachin Chandrashekhar - Data Engineering Hub. All Rights Reserved.
+# This code is provided as part of a paid training program.
+# Licensed for personal educational use only.
+# If found on a public repository without authorization, notify: legal@dataengineeringhub.in
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DEH Bootcamp - Lyft Pipeline Resources (Glue, Step Functions, Lambda, EventBridge)'
+
+Parameters:
+  AccountId:
+    Type: String
+    Description: AWS Account ID
+
+Resources:
+
+  # =========================================================
+  # Glue Databases
+  # =========================================================
+  RawDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AccountId
+      DatabaseInput:
+        Name: nyctlc_raw
+        Description: DEH Bootcamp - Raw layer
+
+  CuratedDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AccountId
+      DatabaseInput:
+        Name: nyctlc_curated
+        Description: DEH Bootcamp - Curated layer
+
+  AggregatedDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AccountId
+      DatabaseInput:
+        Name: nyctlc_aggregated
+        Description: DEH Bootcamp - Aggregated layer
+
+  # =========================================================
+  # Glue Jobs
+  # =========================================================
+  IngestionJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: mission-deh-hof-nyctlc-ingestion
+      Role: !ImportValue mission-deh-hof-glue-role-arn
+      Command:
+        Name: pythonshell
+        PythonVersion: '3.9'
+        ScriptLocation: !Sub 's3://mission-deh-hof-nyctlc-${AccountId}/scripts/backup-nyctlc-ingestion.py'
+      MaxCapacity: 0.0625
+      Timeout: 30
+      MaxRetries: 0
+      GlueVersion: '3.0'
+
+  RawToCuratedJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: mission-deh-hof-raw-to-curated-etl
+      Role: !ImportValue mission-deh-hof-glue-role-arn
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://mission-deh-hof-nyctlc-${AccountId}/scripts/backup-raw-to-curated.py'
+      GlueVersion: '5.1'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      MaxRetries: 0
+
+  CuratedToAggregatedJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: mission-deh-hof-curated-to-aggregated-etl
+      Role: !ImportValue mission-deh-hof-glue-role-arn
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://mission-deh-hof-nyctlc-${AccountId}/scripts/backup-curated-to-aggregated.py'
+      GlueVersion: '5.1'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      MaxRetries: 0
+
+  # =========================================================
+  # Glue Crawlers
+  # =========================================================
+  RawCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: mission-deh-hof-crawler-raw
+      Role: !ImportValue mission-deh-hof-glue-role-arn
+      DatabaseName: !Ref RawDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://mission-deh-hof-nyctlc-${AccountId}/raw/nyctlc/fhvhv_tripdata/'
+          - Path: !Sub 's3://mission-deh-hof-nyctlc-${AccountId}/raw/nyctlc/taxi_zone_lookup/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  CuratedCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: mission-deh-hof-crawler-curated
+      Role: !ImportValue mission-deh-hof-glue-role-arn
+      DatabaseName: !Ref CuratedDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://mission-deh-hof-nyctlc-${AccountId}/curated/nyctlc/fhvhv_trips_curated/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  AggregatedCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: mission-deh-hof-crawler-aggregated
+      Role: !ImportValue mission-deh-hof-glue-role-arn
+      DatabaseName: !Ref AggregatedDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://mission-deh-hof-nyctlc-${AccountId}/aggregated/nyctlc/daily_borough_summary/'
+          - Path: !Sub 's3://mission-deh-hof-nyctlc-${AccountId}/aggregated/nyctlc/hourly_pattern_summary/'
+          - Path: !Sub 's3://mission-deh-hof-nyctlc-${AccountId}/aggregated/nyctlc/route_summary/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # =========================================================
+  # Step Function - Full Pipeline (scheduled monthly)
+  # =========================================================
+  FullPipeline:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: mission-deh-hof-lyft-pipeline
+      RoleArn: !ImportValue mission-deh-hof-sfn-role-arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Lyft NYCTLC Data Pipeline - Orchestrated by Step Functions",
+          "StartAt": "RunIngestion",
+          "States": {
+            "RunIngestion": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {"JobName": "mission-deh-hof-nyctlc-ingestion"},
+              "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+              "Next": "RunRawToCurated"
+            },
+            "RunRawToCurated": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {"JobName": "mission-deh-hof-raw-to-curated-etl"},
+              "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+              "Next": "RunCuratedToAggregated"
+            },
+            "RunCuratedToAggregated": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {"JobName": "mission-deh-hof-curated-to-aggregated-etl"},
+              "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+              "Next": "NotifySuccess"
+            },
+            "NotifySuccess": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "arn:aws:sns:${AWS::Region}:${AccountId}:mission-deh-hof-pipeline-alerts",
+                "Subject": "✅ Lyft Pipeline Complete - Data Available",
+                "Message": "Pipeline complete. All jobs finished successfully."
+              },
+              "Next": "PipelineSucceeded"
+            },
+            "PipelineSucceeded": {"Type": "Succeed"},
+            "NotifyFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "arn:aws:sns:${AWS::Region}:${AccountId}:mission-deh-hof-pipeline-alerts",
+                "Subject": "❌ Lyft Pipeline FAILED",
+                "Message.$": "States.Format('Pipeline failed. Error: {}', $.error.Cause)"
+              },
+              "Next": "PipelineFailed"
+            },
+            "PipelineFailed": {"Type": "Fail", "Error": "PipelineExecutionFailed", "Cause": "One or more Glue jobs failed."}
+          }
+        }
+
+  # =========================================================
+  # Step Function - Transform Pipeline (event-driven)
+  # =========================================================
+  TransformPipeline:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: mission-deh-hof-lyft-transform-pipeline
+      RoleArn: !ImportValue mission-deh-hof-sfn-role-arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Lyft Transform Pipeline - Triggered by ingestion.done",
+          "StartAt": "RawToCurated",
+          "States": {
+            "RawToCurated": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {"JobName": "mission-deh-hof-raw-to-curated-etl"},
+              "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+              "Next": "CuratedToAggregated"
+            },
+            "CuratedToAggregated": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {"JobName": "mission-deh-hof-curated-to-aggregated-etl"},
+              "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+              "Next": "NotifySuccess"
+            },
+            "NotifySuccess": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "arn:aws:sns:${AWS::Region}:${AccountId}:mission-deh-hof-pipeline-alerts",
+                "Subject": "✅ Transform Pipeline Complete - Data Available",
+                "Message": "Transform pipeline complete. Curated and aggregated data ready."
+              },
+              "Next": "PipelineSucceeded"
+            },
+            "PipelineSucceeded": {"Type": "Succeed"},
+            "NotifyFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "arn:aws:sns:${AWS::Region}:${AccountId}:mission-deh-hof-pipeline-alerts",
+                "Subject": "❌ Transform Pipeline FAILED",
+                "Message.$": "States.Format('Transform failed. Error: {}', $.error.Cause)"
+              },
+              "Next": "PipelineFailed"
+            },
+            "PipelineFailed": {"Type": "Fail", "Error": "TransformFailed", "Cause": "Transform job failed."}
+          }
+        }
+
+  # =========================================================
+  # Lambda Function (S3 event trigger)
+  # =========================================================
+  PipelineTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: mission-deh-hof-pipeline-trigger
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !ImportValue mission-deh-hof-lambda-role-arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        S3Bucket: !Sub 'mission-deh-hof-nyctlc-${AccountId}'
+        S3Key: lambda/pipeline-trigger.zip
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref TransformPipeline
+
+  # Lambda permission for S3 to invoke
+  LambdaS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PipelineTriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::mission-deh-hof-nyctlc-${AccountId}'
+
+  # =========================================================
+  # EventBridge Schedule (monthly, disabled)
+  # =========================================================
+  PipelineSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: mission-deh-hof-pipeline-schedule
+      ScheduleExpression: 'cron(0 6 5 * ? *)'
+      State: DISABLED
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !Ref FullPipeline
+        RoleArn: !ImportValue mission-deh-hof-sfn-role-arn
+
+Outputs:
+  FullPipelineArn:
+    Value: !Ref FullPipeline
+  TransformPipelineArn:
+    Value: !Ref TransformPipeline
+  LambdaFunctionArn:
+    Value: !GetAtt PipelineTriggerFunction.Arn

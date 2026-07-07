@@ -1,0 +1,199 @@
+# Copyright © Sachin Chandrashekhar - Data Engineering Hub. All Rights Reserved.
+# This code is provided as part of a paid training program.
+# Licensed for personal educational use only.
+# If found on a public repository without authorization, notify: legal@dataengineeringhub.in
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DEH Bootcamp - Lyft Pipeline Infrastructure (S3, IAM, DynamoDB, SNS)'
+
+Parameters:
+  AccountId:
+    Type: String
+    Description: AWS Account ID
+
+Resources:
+
+  # =========================================================
+  # S3 Bucket
+  # =========================================================
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'mission-deh-hof-nyctlc-${AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: mission-deh-hof-raw-to-ia
+            Status: Enabled
+            Prefix: raw/
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+          - Id: mission-deh-hof-rejected-cleanup
+            Status: Enabled
+            Prefix: rejected/
+            ExpirationInDays: 15
+
+  # =========================================================
+  # IAM Role for Glue
+  # =========================================================
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: mission-deh-hof-glue-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+      Policies:
+        - PolicyName: GluePassRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AccountId}:role/mission-deh-hof-glue-role'
+
+  # =========================================================
+  # IAM Role for Step Functions
+  # =========================================================
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: mission-deh-hof-stepfunctions-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSGlueConsoleFullAccess
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+
+  # =========================================================
+  # IAM Role for EventBridge Scheduler
+  # =========================================================
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: mission-deh-hof-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsStartExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource:
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AccountId}:stateMachine:mission-deh-hof-lyft-pipeline'
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AccountId}:stateMachine:mission-deh-hof-lyft-transform-pipeline'
+
+  # =========================================================
+  # IAM Role for Lambda Trigger
+  # =========================================================
+  LambdaTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: mission-deh-hof-lambda-trigger-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StepFunctionsStartExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource:
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AccountId}:stateMachine:mission-deh-hof-lyft-pipeline'
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AccountId}:stateMachine:mission-deh-hof-lyft-transform-pipeline'
+
+  # =========================================================
+  # SNS Topic
+  # =========================================================
+  PipelineAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: mission-deh-hof-pipeline-alerts
+
+  # =========================================================
+  # DynamoDB Tables
+  # =========================================================
+  MetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: mission-deh-hof-datalake-metadata
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pipeline_name
+          AttributeType: S
+        - AttributeName: job_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pipeline_name
+          KeyType: HASH
+        - AttributeName: job_name
+          KeyType: RANGE
+
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: mission-deh-hof-job-audit
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_name
+          AttributeType: S
+        - AttributeName: run_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_name
+          KeyType: HASH
+        - AttributeName: run_timestamp
+          KeyType: RANGE
+
+Outputs:
+  BucketName:
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: mission-deh-hof-bucket-name
+  GlueRoleArn:
+    Value: !GetAtt GlueRole.Arn
+    Export:
+      Name: mission-deh-hof-glue-role-arn
+  StepFunctionsRoleArn:
+    Value: !GetAtt StepFunctionsRole.Arn
+    Export:
+      Name: mission-deh-hof-sfn-role-arn
+  LambdaTriggerRoleArn:
+    Value: !GetAtt LambdaTriggerRole.Arn
+    Export:
+      Name: mission-deh-hof-lambda-role-arn
+  SNSTopicArn:
+    Value: !Ref PipelineAlertsTopic
+    Export:
+      Name: mission-deh-hof-sns-topic-arn
